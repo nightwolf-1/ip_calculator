@@ -27,7 +27,7 @@ Display help and command usage information.
 ## Clone and build 
 1. Clone the repository
 ```bash
-git clone <repository-url>
+git clone 
 cd ip_calculator
 ```
 2. Build the program
