@@ -216,18 +216,6 @@ impl CommandHelp {
                 ],
             },
             CommandHelp {
-                name: "tui",
-                aliases: &["-t", "--tui"],
-                short_desc: "Launch terminal interface",
-                long_desc: "Start the interactive terminal user interface with IP calculator \
-                           and network scanner tools.",
-                usage: "./ip_calculator (-t|--tui)",
-                examples: &[
-                    "./ip_calculator --tui",
-                    "./ip_calculator -t",
-                ],
-            },
-            CommandHelp {
                 name: "help",
                 aliases: &["-h", "--help"],
                 short_desc: "Display help information",
