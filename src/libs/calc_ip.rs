@@ -58,12 +58,33 @@ pub enum MaskOrCidr {
     Cidr(u8),
 }
 
+impl MaskOrCidr {
+    pub fn expect_mask(self) -> Ipv4Addr {
+        match self {
+            MaskOrCidr::Mask(m) => m,
+            _ => unreachable!(),
+        }
+    }
+    pub fn expect_cidr(self) -> u8 {
+        match self {
+            MaskOrCidr::Cidr(c) => c,
+            _ => unreachable!(),
+        }
+    }
+}
+
+pub enum InputType {
+    Cidr,
+    Mask,
+}
+
 pub enum Command {
     Subnets {
         cidr: String,
         prefix: u8,
         filter: Option<usize>,
-        page: Option<usize>
+        page: Option<usize>,
+        output_file: Option<String>,
     },
     GetSubnet {
         cidr: String,
@@ -106,7 +127,7 @@ impl CommandHelp {
         vec![
             CommandHelp {
                 name: "display",
-                aliases: &[""],
+                aliases: &[],
                 short_desc: "Display subnet information",
                 long_desc: "Display detailed information about a subnet, including network address, \
                            broadcast address, mask, number of available hosts, and usable IP range.",
@@ -123,12 +144,14 @@ impl CommandHelp {
                 short_desc: "Calculate network subnets",
                 long_desc: "Divide a network into smaller subnets. The command ensures no subnet overlapping \
                            and provides detailed information for each subnet. Use the -f option to limit the \
-                           number of displayed subnets by default 512 if is possible.",
-                usage: "./ip_calculator (-s|--subnets) <CIDR> <new_prefix> ([-f <number_of_subnets>]|[-p <page_number>])",
+                           number of displayed subnets by default 4 if is possible. Use -o to write all \
+                           matching subnets to a file.",
+                usage: "./ip_calculator (-s|--subnets) <CIDR> <new_prefix> [-f <number>] [-p <page (1-indexed)>] [-o <file>]",
                 examples: &[
                     "./ip_calculator -s 192.168.1.0/24 26",
                     "./ip_calculator --subnets 10.0.0.0/8 16 -f 5",
-                    "./ip_calculator -s 10.0.0.0/15 30 -p 10"
+                    "./ip_calculator -s 10.0.0.0/15 30 -p 10",
+                    "./ip_calculator -s 10.0.0.0/16 24 -o output.txt"
                 ],
             },
             CommandHelp {
@@ -193,6 +216,18 @@ impl CommandHelp {
                 ],
             },
             CommandHelp {
+                name: "tui",
+                aliases: &["-t", "--tui"],
+                short_desc: "Launch terminal interface",
+                long_desc: "Start the interactive terminal user interface with IP calculator \
+                           and network scanner tools.",
+                usage: "./ip_calculator (-t|--tui)",
+                examples: &[
+                    "./ip_calculator --tui",
+                    "./ip_calculator -t",
+                ],
+            },
+            CommandHelp {
                 name: "help",
                 aliases: &["-h", "--help"],
                 short_desc: "Display help information",
@@ -248,6 +283,7 @@ impl CommandHelp {
 }
 
 
+#[derive(Debug)]
 pub struct Subnet {
     pub network: Ipv4Addr,
     pub mask: Ipv4Addr,
@@ -266,23 +302,31 @@ impl Subnet {
             ));
         }
 
-        let mask = Ipv4Addr::from(!(u32::MAX >> prefix));
+        let mask = Ipv4Addr::from(if prefix == 32 {
+            u32::MAX
+        } else {
+            !(u32::MAX >> prefix)
+        });
         let network_u32 = u32::from(network) & u32::from(mask);
         let broadcast_u32 = network_u32 | !u32::from(mask);
 
-        let (first_usable, last_usable) = if prefix < 31 {
+        let (first_usable, last_usable) = if prefix >= 31 {
+            (
+                Some(Ipv4Addr::from(network_u32)),
+                Some(Ipv4Addr::from(broadcast_u32)),
+            )
+        } else {
             (
                 Some(Ipv4Addr::from(network_u32 + 1)),
                 Some(Ipv4Addr::from(broadcast_u32 - 1)),
             )
-        } else {
-            (None, None)
         };
 
         let num_hosts = match prefix {
             32 => 1,
             31 => 2,
-            _ => 2u32.pow((32 - prefix) as u32) - 2,
+            0 => u32::MAX - 1,
+            _ => (1u32 << (32 - prefix)) - 2,
         };
 
         Ok(Subnet {
@@ -304,12 +348,6 @@ impl Subnet {
     }
 
     pub fn get_available_hosts(&self) -> Result<Vec<Ipv4Addr>, IpCalculatorError> {
-        if self.prefix >= 31 {
-            return Err(IpCalculatorError::SubnetError(
-                "No usable hosts in /31 or /32 networks".to_string(),
-            ));
-        }
-
         let first = self.first_usable.ok_or_else(|| {
             IpCalculatorError::SubnetError("No first usable address available".to_string())
         })?;
@@ -327,6 +365,21 @@ impl Subnet {
             || self.contains_ip(other.broadcast)
             || other.contains_ip(self.network)
             || other.contains_ip(self.broadcast)
+    }
+}
+
+impl Subnet {
+    pub fn to_plain_text(&self) -> String {
+        format!(
+            "Network: {}\nMask: {}\nCidr: {}\nBroadcast: {}\nFirst: {}\nLast: {}\nHosts: {}",
+            self.network,
+            self.mask,
+            self.prefix,
+            self.broadcast,
+            self.first_usable.map_or("N/A".to_string(), |ip| ip.to_string()),
+            self.last_usable.map_or("N/A".to_string(), |ip| ip.to_string()),
+            self.num_hosts
+        )
     }
 }
 
@@ -370,13 +423,10 @@ pub fn calculate_subnet(cidr: &str) -> Result<Subnet, IpCalculatorError> {
     Subnet::new(ip, prefix)
 }
 
-pub fn check_ip(ip: &str) -> Result<bool, IpCalculatorError> {
-    match Ipv4Addr::from_str(ip) {
-        Ok(_) => Ok(true),
-        Err(_) => Err(IpCalculatorError::IpError(
-            format!("Invalid IP address format: {} - IP addresses must be in the format xxx.xxx.xxx.xxx with values between 0 and 255", ip)
-        ))
-    }
+pub fn check_ip(ip: &str) -> Result<(), IpCalculatorError> {
+    Ipv4Addr::from_str(ip).map_err(|_| IpCalculatorError::IpError(
+        format!("Invalid IP address format: {} - IP addresses must be in the format xxx.xxx.xxx.xxx with values between 0 and 255", ip)
+    )).map(|_| ())
 }
 
 pub fn are_in_same_subnet(
@@ -400,7 +450,7 @@ pub fn generate_subnets(
     new_prefix: u8,
     filter: Option<usize>,
     page: Option<usize>,
-) -> Result<(Vec<Subnet>, u32, usize), IpCalculatorError> {
+) -> Result<(Vec<Subnet>, u32, usize, usize), IpCalculatorError> {
     let subnet = calculate_subnet(cidr)?;
 
     if new_prefix > 32 {
@@ -421,20 +471,22 @@ pub fn generate_subnets(
         .ok_or_else(|| IpCalculatorError::SubnetError("Unable to calculate subnets".to_string()))?;
 
     let base_network = u32::from(subnet.network);
-    let increment = 1u32 << (32 - new_prefix);
+    let increment = 1u32.checked_shl(32 - new_prefix as u32)
+        .ok_or_else(|| IpCalculatorError::SubnetError(
+            "Subnet increment calculation overflow".to_string(),
+        ))?;
 
-    let page_size = 512;
-    let total_to_display = filter.unwrap_or(num_subnets as usize);
-    let total_pages = (total_to_display + page_size - 1) / page_size;
+    let page_size = 4;
+    let max_to_show = std::cmp::min(num_subnets as usize, filter.unwrap_or(usize::MAX));
+    let total_pages = if max_to_show > 0 {
+        (max_to_show + page_size - 1) / page_size
+    } else {
+        0
+    };
     
     let page_number = match page {
-        Some(p) if p >= total_pages => {
-            if total_pages > 0 {
-                total_pages - 1
-            } else {
-                0
-            }
-        },
+        Some(_) if total_pages == 0 => 0,
+        Some(p) if p >= total_pages => total_pages - 1,
         Some(p) => p,
         None => 0,
     };
@@ -443,7 +495,7 @@ pub fn generate_subnets(
     let mut subnets: Vec<Subnet> = Vec::new();
     let end_index = std::cmp::min(
         start_index + page_size,
-        std::cmp::min(num_subnets as usize, total_to_display)
+        max_to_show
     );
 
     for i in start_index..end_index {
@@ -466,19 +518,70 @@ pub fn generate_subnets(
         subnets.push(new_subnet);
     }
 
-    Ok((subnets, num_subnets, total_pages))
+    Ok((subnets, num_subnets, total_pages, page_number))
+}
+
+pub fn generate_all_subnets(
+    cidr: &str,
+    new_prefix: u8,
+    filter: Option<usize>,
+) -> Result<Vec<Subnet>, IpCalculatorError> {
+    let subnet = calculate_subnet(cidr)?;
+
+    if new_prefix > 32 {
+        return Err(IpCalculatorError::InvalidPrefix(
+            "The new prefix cannot exceed 32".to_string(),
+        ));
+    }
+
+    if new_prefix <= subnet.prefix {
+        return Err(IpCalculatorError::InvalidPrefix(format!(
+            "New prefix ({}) must be greater than current prefix ({})",
+            new_prefix, subnet.prefix
+        )));
+    }
+
+    let num_subnets = 1u32
+        .checked_shl((new_prefix - subnet.prefix) as u32)
+        .ok_or_else(|| IpCalculatorError::SubnetError("Unable to calculate subnets".to_string()))?;
+
+    let base_network = u32::from(subnet.network);
+    let increment = 1u32.checked_shl(32 - new_prefix as u32)
+        .ok_or_else(|| IpCalculatorError::SubnetError(
+            "Subnet increment calculation overflow".to_string(),
+        ))?;
+
+    let count = std::cmp::min(num_subnets as usize, filter.unwrap_or(num_subnets as usize));
+    let mut subnets: Vec<Subnet> = Vec::with_capacity(count);
+
+    for i in 0..count {
+        let new_network = base_network.checked_add((i as u32) * increment).ok_or_else(|| {
+            IpCalculatorError::SubnetError(
+                "Overflow occurred while calculating subnets".to_string(),
+            )
+        })?;
+
+        let new_subnet = Subnet::new(Ipv4Addr::from(new_network), new_prefix)?;
+
+        if subnets.iter().any(|existing| existing.overlaps_with(&new_subnet)) {
+            return Err(IpCalculatorError::SubnetError(
+                format!("Generated subnet {} overlaps with existing subnets - this should not happen!",
+                    new_subnet.network
+                )
+            ));
+        }
+
+        subnets.push(new_subnet);
+    }
+
+    Ok(subnets)
 }
 
 pub fn get_subnet(cidr: &str, new_prefix: u8, index: u32) -> Result<(), IpCalculatorError> {
-    let base_subnet = match calculate_subnet(cidr) {
-        Ok(subnet) => subnet,
-        Err(_) => {
-            return Err(IpCalculatorError::InvalidCIDR(format!(
-                "Invalid CIDR format: {}",
-                cidr
-            )))
-        }
-    };
+    let base_subnet = calculate_subnet(cidr)
+        .map_err(|_| IpCalculatorError::InvalidCIDR(format!(
+            "Invalid CIDR format: {}", cidr
+        )))?;
 
     if new_prefix > 32 {
         return Err(IpCalculatorError::InvalidPrefix(
@@ -493,57 +596,34 @@ pub fn get_subnet(cidr: &str, new_prefix: u8, index: u32) -> Result<(), IpCalcul
         )));
     }
 
-    let num_subnets = match 1u32.checked_shl((new_prefix - base_subnet.prefix) as u32) {
-        Some(n) => n,
-        None => {
-            return Err(IpCalculatorError::SubnetError(
-                "Cannot calculate number of subnets - value overflow".to_string(),
-            ))
-        }
-    };
+    let num_subnets = 1u32.checked_shl((new_prefix - base_subnet.prefix) as u32)
+        .ok_or_else(|| IpCalculatorError::SubnetError(
+            "Cannot calculate number of subnets - value overflow".to_string(),
+        ))?;
 
-    if index >= num_subnets {
+    let actual_index = if index >= num_subnets {
         println!(
             "Warning: Requested subnet index {} exceeds available subnets ({})",
             index, num_subnets
         );
-
-        let last_index = num_subnets - 1;
-        let base_network = u32::from(base_subnet.network);
-        let increment = 1u32 << (32 - new_prefix);
-
-        let new_network = match base_network.checked_add(last_index * increment) {
-            Some(n) => n,
-            None => {
-                return Err(IpCalculatorError::SubnetError(
-                    "Network address calculation overflow".to_string(),
-                ))
-            }
-        };
-
-        match Subnet::new(Ipv4Addr::from(new_network), new_prefix) {
-            Ok(subnet) => println!("{}", subnet),
-            Err(e) => return Err(e),
-        }
+        num_subnets - 1
     } else {
-        let base_network = u32::from(base_subnet.network);
-        let increment = 1u32 << (32 - new_prefix);
+        index
+    };
 
-        let new_network = match base_network.checked_add(index * increment) {
-            Some(n) => n,
-            None => {
-                return Err(IpCalculatorError::SubnetError(
-                    "Network address calculation overflow".to_string(),
-                ))
-            }
-        };
+    let base_network = u32::from(base_subnet.network);
+    let increment = 1u32.checked_shl(32 - new_prefix as u32)
+        .ok_or_else(|| IpCalculatorError::SubnetError(
+            "Subnet increment calculation overflow".to_string(),
+        ))?;
 
-        match Subnet::new(Ipv4Addr::from(new_network), new_prefix) {
-            Ok(subnet) => println!("{}", subnet),
-            Err(e) => return Err(e),
-        }
-    }
+    let new_network = base_network.checked_add(actual_index * increment)
+        .ok_or_else(|| IpCalculatorError::SubnetError(
+            "Network address calculation overflow".to_string(),
+        ))?;
 
+    let subnet = Subnet::new(Ipv4Addr::from(new_network), new_prefix)?;
+    println!("{}", subnet);
     Ok(())
 }
 
@@ -594,14 +674,14 @@ pub fn find_ip_range(
         .ok_or_else(|| IpCalculatorError::InvalidRange("No suitable range found".to_string()))
 }
 
-pub fn is_cidr_or_mask(input: &str) -> Result<&'static str, IpCalculatorError> {
+pub fn is_cidr_or_mask(input: &str) -> Result<InputType, IpCalculatorError> {
     if check_mask(input)? {
         if let Ok(cidr) = input.parse::<u8>() {
             if cidr <= 32 {
-                return Ok("CIDR");
+                return Ok(InputType::Cidr);
             }
         } else if Ipv4Addr::from_str(input).is_ok() {
-            return Ok("Mask");
+            return Ok(InputType::Mask);
         }
     }
     Err(IpCalculatorError::ConversionError(
@@ -615,11 +695,20 @@ pub fn cidr_to_mask(cidr: u8) -> Result<Ipv4Addr, IpCalculatorError> {
             "CIDR prefix cannot exceed 32".to_string(),
         ));
     }
-    Ok(Ipv4Addr::from(!(u32::MAX >> cidr)))
+    Ok(Ipv4Addr::from(if cidr == 32 {
+        u32::MAX
+    } else {
+        !(u32::MAX >> cidr)
+    }))
 }
 
 pub fn mask_to_cidr(mask: Ipv4Addr) -> Result<u8, IpCalculatorError> {
     let mask_u32 = u32::from(mask);
+
+    if mask_u32 == 0 {
+        return Ok(0);
+    }
+
     let inverted = !mask_u32;
 
     if !inverted.wrapping_add(1).is_power_of_two() {
@@ -640,21 +729,18 @@ pub fn check_mask(mask: &str) -> Result<bool, IpCalculatorError> {
         .map_err(|_| IpCalculatorError::InvalidMask("Invalid mask format".to_string()))?;
 
     let mask_u32 = u32::from(mask_addr);
+    if mask_u32 == 0 {
+        return Ok(true);
+    }
     let inverted = !mask_u32;
     Ok(inverted.wrapping_add(1).is_power_of_two())
 }
 
-pub fn parse_mask_or_cidr(input: &str, return_type: &str) -> Result<MaskOrCidr, IpCalculatorError> {
-    let input_type = match is_cidr_or_mask(input)? {
-        "Mask" => "Mask",
-        "CIDR" => "CIDR",
-        _ => return Err(IpCalculatorError::ConversionError(
-            format!("Input '{}' is neither a valid mask nor CIDR", input)
-        ))
-    };
+pub fn parse_mask_or_cidr(input: &str, return_type: InputType) -> Result<MaskOrCidr, IpCalculatorError> {
+    let input_type = is_cidr_or_mask(input)?;
 
-    match (input_type, return_type) {
-        ("Mask", "cidr") => {
+    match (&input_type, &return_type) {
+        (InputType::Mask, InputType::Cidr) => {
             let mask = Ipv4Addr::from_str(input).map_err(|_| 
                 IpCalculatorError::MaskError(
                     format!("Invalid mask format: {}", input)
@@ -663,7 +749,7 @@ pub fn parse_mask_or_cidr(input: &str, return_type: &str) -> Result<MaskOrCidr, 
             let cidr = mask_to_cidr(mask)?;
             Ok(MaskOrCidr::Cidr(cidr))
         },
-        ("CIDR", "mask") => {
+        (InputType::Cidr, InputType::Mask) => {
             let cidr = input.parse::<u8>().map_err(|_| 
                 IpCalculatorError::InvalidPrefix(
                     format!("Invalid CIDR prefix: {}", input)
@@ -672,7 +758,7 @@ pub fn parse_mask_or_cidr(input: &str, return_type: &str) -> Result<MaskOrCidr, 
             let mask = cidr_to_mask(cidr)?;
             Ok(MaskOrCidr::Mask(mask))
         },
-        ("Mask", "mask") => {
+        (InputType::Mask, InputType::Mask) => {
             let mask = Ipv4Addr::from_str(input).map_err(|_|
                 IpCalculatorError::MaskError(
                     format!("Invalid mask format: {}", input)
@@ -680,7 +766,7 @@ pub fn parse_mask_or_cidr(input: &str, return_type: &str) -> Result<MaskOrCidr, 
             )?;
             Ok(MaskOrCidr::Mask(mask))
         },
-        ("CIDR", "cidr") => {
+        (InputType::Cidr, InputType::Cidr) => {
             let cidr = input.parse::<u8>().map_err(|_|
                 IpCalculatorError::InvalidPrefix(
                     format!("Invalid CIDR prefix: {}", input)
@@ -688,16 +774,13 @@ pub fn parse_mask_or_cidr(input: &str, return_type: &str) -> Result<MaskOrCidr, 
             )?;
             Ok(MaskOrCidr::Cidr(cidr))
         },
-        _ => Err(IpCalculatorError::ConversionError(
-            format!("Cannot convert {} to {}", input_type, return_type)
-        ))
     }
 }
 
 pub fn execute_command(command: Command) -> Result<(), IpCalculatorError> {
     match command {
-        Command::Subnets { cidr, prefix, filter, page } => {
-            let (subnets, total_subnets, total_pages) = generate_subnets(&cidr, prefix, filter, page)
+        Command::Subnets { cidr, prefix, filter, page, output_file } => {
+            let (subnets, total_subnets, total_pages, page_number) = generate_subnets(&cidr, prefix, filter, page)
                 .map_err(|e| IpCalculatorError::SubnetError(
                     format!("Failed to generate subnets: {}", e)
                 ))?;
@@ -705,15 +788,33 @@ pub fn execute_command(command: Command) -> Result<(), IpCalculatorError> {
             let displayed = subnets.len();
             let requested_page = page.unwrap_or(0);    
             
-            for subnet in subnets {
+            for subnet in &subnets {
                 println!("{}", subnet);
                 println!("----------------------------");
             }
-            if requested_page >= total_pages {
+            if requested_page >= total_pages && total_pages > 0 {
                 println!("\x1b[1;33mWarning: Only {} pages available. Showing last page.\x1b[0m", total_pages);
             }
             println!("\nTotal subnets: {} | Subnets displayed: {}", total_subnets, displayed);
-            println!("Page {}/{}", total_pages, total_pages);
+            if total_pages > 0 {
+                println!("Page {}/{}", page_number + 1, total_pages);
+            }
+
+            if let Some(path) = output_file {
+                let all = generate_all_subnets(&cidr, prefix, filter)
+                    .map_err(|e| IpCalculatorError::SubnetError(
+                        format!("Failed to generate subnets for output file: {}", e)
+                    ))?;
+                let content = all.iter()
+                    .map(|s| s.to_plain_text())
+                    .collect::<Vec<_>>()
+                    .join("\n----------------------------\n");
+                std::fs::write(&path, content)
+                    .map_err(|e| IpCalculatorError::SubnetError(
+                        format!("Failed to write output file '{}': {}", path, e)
+                    ))?;
+                println!("Output written to {}", path);
+            }
             
             Ok(())
         },
@@ -737,15 +838,11 @@ pub fn execute_command(command: Command) -> Result<(), IpCalculatorError> {
             Ok(())
         },
         Command::CheckIP { ip } => {
-            match check_ip(&ip)? {
-                true => {
-                    println!("IP address {} is valid", ip);
-                    Ok(())
-                },
-                false => Err(IpCalculatorError::InvalidIP(
-                    format!("Invalid IP address format: {}", ip)
-                ))
-            }
+            check_ip(&ip).map_err(|_| IpCalculatorError::InvalidIP(
+                format!("Invalid IP address format: {}", ip)
+            ))?;
+            println!("IP address {} is valid", ip);
+            Ok(())
         },
         Command::CheckMask { mask } => {
             match check_mask(&mask)? {
@@ -774,5 +871,375 @@ pub fn execute_command(command: Command) -> Result<(), IpCalculatorError> {
             println!("{}", subnet);
             Ok(())
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_subnet_new_basic() {
+        let subnet = Subnet::new(Ipv4Addr::new(192, 168, 1, 0), 24).unwrap();
+        assert_eq!(subnet.network, Ipv4Addr::new(192, 168, 1, 0));
+        assert_eq!(subnet.mask, Ipv4Addr::new(255, 255, 255, 0));
+        assert_eq!(subnet.broadcast, Ipv4Addr::new(192, 168, 1, 255));
+        assert_eq!(subnet.first_usable, Some(Ipv4Addr::new(192, 168, 1, 1)));
+        assert_eq!(subnet.last_usable, Some(Ipv4Addr::new(192, 168, 1, 254)));
+        assert_eq!(subnet.prefix, 24);
+        assert_eq!(subnet.num_hosts, 254);
+    }
+
+    #[test]
+    fn test_subnet_new_invalid_prefix() {
+        let err = Subnet::new(Ipv4Addr::new(0, 0, 0, 0), 33).unwrap_err();
+        assert!(matches!(err, IpCalculatorError::InvalidPrefix(_)));
+    }
+
+    #[test]
+    fn test_subnet_new_prefix_31() {
+        let subnet = Subnet::new(Ipv4Addr::new(10, 0, 0, 0), 31).unwrap();
+        assert_eq!(subnet.network, Ipv4Addr::new(10, 0, 0, 0));
+        assert_eq!(subnet.mask, Ipv4Addr::new(255, 255, 255, 254));
+        assert_eq!(subnet.broadcast, Ipv4Addr::new(10, 0, 0, 1));
+        assert_eq!(subnet.first_usable, Some(Ipv4Addr::new(10, 0, 0, 0)));
+        assert_eq!(subnet.last_usable, Some(Ipv4Addr::new(10, 0, 0, 1)));
+        assert_eq!(subnet.num_hosts, 2);
+    }
+
+    #[test]
+    fn test_subnet_new_prefix_32() {
+        let subnet = Subnet::new(Ipv4Addr::new(10, 0, 0, 5), 32).unwrap();
+        assert_eq!(subnet.network, Ipv4Addr::new(10, 0, 0, 5));
+        assert_eq!(subnet.mask, Ipv4Addr::new(255, 255, 255, 255));
+        assert_eq!(subnet.broadcast, Ipv4Addr::new(10, 0, 0, 5));
+        assert_eq!(subnet.first_usable, Some(Ipv4Addr::new(10, 0, 0, 5)));
+        assert_eq!(subnet.last_usable, Some(Ipv4Addr::new(10, 0, 0, 5)));
+        assert_eq!(subnet.num_hosts, 1);
+    }
+
+    #[test]
+    fn test_subnet_new_prefix_0() {
+        let subnet = Subnet::new(Ipv4Addr::new(0, 0, 0, 0), 0).unwrap();
+        assert_eq!(subnet.network, Ipv4Addr::new(0, 0, 0, 0));
+        assert_eq!(subnet.mask, Ipv4Addr::new(0, 0, 0, 0));
+        assert_eq!(subnet.prefix, 0);
+        assert_eq!(subnet.num_hosts, u32::MAX - 1);
+    }
+
+    #[test]
+    fn test_subnet_network_alignment() {
+        let subnet = Subnet::new(Ipv4Addr::new(192, 168, 1, 42), 24).unwrap();
+        assert_eq!(subnet.network, Ipv4Addr::new(192, 168, 1, 0));
+    }
+
+    #[test]
+    fn test_contains_ip() {
+        let subnet = Subnet::new(Ipv4Addr::new(10, 0, 0, 0), 24).unwrap();
+        assert!(subnet.contains_ip(Ipv4Addr::new(10, 0, 0, 1)));
+        assert!(subnet.contains_ip(Ipv4Addr::new(10, 0, 0, 255)));
+        assert!(subnet.contains_ip(Ipv4Addr::new(10, 0, 0, 0)));
+        assert!(!subnet.contains_ip(Ipv4Addr::new(10, 0, 1, 0)));
+        assert!(!subnet.contains_ip(Ipv4Addr::new(11, 0, 0, 1)));
+    }
+
+    #[test]
+    fn test_get_available_hosts_24() {
+        let subnet = Subnet::new(Ipv4Addr::new(10, 0, 0, 0), 24).unwrap();
+        let hosts = subnet.get_available_hosts().unwrap();
+        assert_eq!(hosts.len(), 254);
+        assert_eq!(hosts[0], Ipv4Addr::new(10, 0, 0, 1));
+        assert_eq!(hosts[253], Ipv4Addr::new(10, 0, 0, 254));
+    }
+
+    #[test]
+    fn test_get_available_hosts_31() {
+        let subnet = Subnet::new(Ipv4Addr::new(10, 0, 0, 0), 31).unwrap();
+        let hosts = subnet.get_available_hosts().unwrap();
+        assert_eq!(hosts.len(), 2);
+        assert_eq!(hosts[0], Ipv4Addr::new(10, 0, 0, 0));
+        assert_eq!(hosts[1], Ipv4Addr::new(10, 0, 0, 1));
+    }
+
+    #[test]
+    fn test_get_available_hosts_32() {
+        let subnet = Subnet::new(Ipv4Addr::new(10, 0, 0, 5), 32).unwrap();
+        let hosts = subnet.get_available_hosts().unwrap();
+        assert_eq!(hosts.len(), 1);
+        assert_eq!(hosts[0], Ipv4Addr::new(10, 0, 0, 5));
+    }
+
+    #[test]
+    fn test_overlaps_with() {
+        let a = Subnet::new(Ipv4Addr::new(10, 0, 0, 0), 24).unwrap();
+        let b = Subnet::new(Ipv4Addr::new(10, 0, 0, 128), 25).unwrap();
+        assert!(a.overlaps_with(&b));
+        assert!(b.overlaps_with(&a));
+
+        let c = Subnet::new(Ipv4Addr::new(10, 0, 1, 0), 24).unwrap();
+        assert!(!a.overlaps_with(&c));
+        assert!(!c.overlaps_with(&a));
+    }
+
+    #[test]
+    fn test_calculate_subnet() {
+        let subnet = calculate_subnet("192.168.1.0/24").unwrap();
+        assert_eq!(subnet.network, Ipv4Addr::new(192, 168, 1, 0));
+        assert_eq!(subnet.prefix, 24);
+    }
+
+    #[test]
+    fn test_calculate_subnet_invalid_format() {
+        let err = calculate_subnet("192.168.1.0").unwrap_err();
+        assert!(matches!(err, IpCalculatorError::InvalidCIDR(_)));
+    }
+
+    #[test]
+    fn test_calculate_subnet_invalid_ip() {
+        let err = calculate_subnet("999.999.999.999/24").unwrap_err();
+        assert!(matches!(err, IpCalculatorError::InvalidIP(_)));
+    }
+
+    #[test]
+    fn test_check_ip_valid() {
+        assert!(check_ip("192.168.1.1").is_ok());
+        assert!(check_ip("0.0.0.0").is_ok());
+        assert!(check_ip("255.255.255.255").is_ok());
+    }
+
+    #[test]
+    fn test_check_ip_invalid() {
+        assert!(check_ip("999.999.999.999").is_err());
+        assert!(check_ip("not-an-ip").is_err());
+        assert!(check_ip("256.0.0.0").is_err());
+    }
+
+    #[test]
+    fn test_check_mask() {
+        assert_eq!(check_mask("24").unwrap(), true);
+        assert_eq!(check_mask("0").unwrap(), true);
+        assert_eq!(check_mask("32").unwrap(), true);
+        assert_eq!(check_mask("33").unwrap(), false);
+        assert_eq!(check_mask("255.255.255.0").unwrap(), true);
+        assert_eq!(check_mask("0.0.0.0").unwrap(), true);
+        assert_eq!(check_mask("255.255.255.255").unwrap(), true);
+        assert!(check_mask("not-a-mask").is_err());
+    }
+
+    #[test]
+    fn test_cidr_to_mask() {
+        assert_eq!(cidr_to_mask(0).unwrap(), Ipv4Addr::new(0, 0, 0, 0));
+        assert_eq!(cidr_to_mask(24).unwrap(), Ipv4Addr::new(255, 255, 255, 0));
+        assert_eq!(cidr_to_mask(32).unwrap(), Ipv4Addr::new(255, 255, 255, 255));
+        assert!(cidr_to_mask(33).is_err());
+    }
+
+    #[test]
+    fn test_mask_to_cidr() {
+        assert_eq!(mask_to_cidr(Ipv4Addr::new(0, 0, 0, 0)).unwrap(), 0);
+        assert_eq!(mask_to_cidr(Ipv4Addr::new(255, 255, 255, 0)).unwrap(), 24);
+        assert_eq!(mask_to_cidr(Ipv4Addr::new(255, 255, 255, 255)).unwrap(), 32);
+        assert_eq!(mask_to_cidr(Ipv4Addr::new(255, 0, 0, 0)).unwrap(), 8);
+        assert!(mask_to_cidr(Ipv4Addr::new(255, 0, 0, 1)).is_err());
+    }
+
+    #[test]
+    fn test_is_cidr_or_mask() {
+        assert!(matches!(is_cidr_or_mask("24").unwrap(), InputType::Cidr));
+        assert!(matches!(is_cidr_or_mask("0").unwrap(), InputType::Cidr));
+        assert!(matches!(is_cidr_or_mask("32").unwrap(), InputType::Cidr));
+        assert!(matches!(is_cidr_or_mask("255.255.255.0").unwrap(), InputType::Mask));
+        assert!(matches!(is_cidr_or_mask("0.0.0.0").unwrap(), InputType::Mask));
+        assert!(is_cidr_or_mask("33").is_err());
+        assert!(is_cidr_or_mask("invalid").is_err());
+    }
+
+    #[test]
+    fn test_parse_mask_or_cidr() {
+        let result = parse_mask_or_cidr("24", InputType::Mask).unwrap();
+        assert_eq!(result.expect_mask(), Ipv4Addr::new(255, 255, 255, 0));
+
+        let result = parse_mask_or_cidr("255.255.255.0", InputType::Cidr).unwrap();
+        assert_eq!(result.expect_cidr(), 24);
+
+        let result = parse_mask_or_cidr("24", InputType::Cidr).unwrap();
+        assert_eq!(result.expect_cidr(), 24);
+
+        let result = parse_mask_or_cidr("255.255.255.0", InputType::Mask).unwrap();
+        assert_eq!(result.expect_mask(), Ipv4Addr::new(255, 255, 255, 0));
+    }
+
+    #[test]
+    fn test_are_in_same_subnet_same_mask() {
+        let result = are_in_same_subnet(
+            Ipv4Addr::new(10, 0, 0, 1),
+            Ipv4Addr::new(10, 0, 0, 2),
+            Ipv4Addr::new(255, 255, 255, 0),
+            None,
+        ).unwrap();
+        assert!(result);
+    }
+
+    #[test]
+    fn test_are_in_same_subnet_different_subnets() {
+        let result = are_in_same_subnet(
+            Ipv4Addr::new(10, 0, 0, 1),
+            Ipv4Addr::new(10, 0, 1, 2),
+            Ipv4Addr::new(255, 255, 255, 0),
+            None,
+        ).unwrap();
+        assert!(!result);
+    }
+
+    #[test]
+    fn test_are_in_same_subnet_different_masks() {
+        let result = are_in_same_subnet(
+            Ipv4Addr::new(10, 0, 0, 1),
+            Ipv4Addr::new(10, 0, 0, 2),
+            Ipv4Addr::new(255, 0, 0, 0),
+            Some(Ipv4Addr::new(255, 255, 255, 0)),
+        ).unwrap();
+        assert!(result);
+    }
+
+    #[test]
+    fn test_generate_subnets_basic() {
+        let (subnets, total, pages, page_num) = generate_subnets("10.0.0.0/24", 26, None, None).unwrap();
+        assert_eq!(subnets.len(), 4);
+        assert_eq!(total, 4);
+        assert_eq!(pages, 1);
+        assert_eq!(page_num, 0);
+        assert_eq!(subnets[0].network, Ipv4Addr::new(10, 0, 0, 0));
+        assert_eq!(subnets[1].network, Ipv4Addr::new(10, 0, 0, 64));
+        assert_eq!(subnets[2].network, Ipv4Addr::new(10, 0, 0, 128));
+        assert_eq!(subnets[3].network, Ipv4Addr::new(10, 0, 0, 192));
+    }
+
+    #[test]
+    fn test_generate_subnets_with_filter() {
+        let (subnets, total, _, _) = generate_subnets("10.0.0.0/8", 16, Some(3), None).unwrap();
+        assert_eq!(subnets.len(), 3);
+        assert_eq!(total, 256);
+    }
+
+    #[test]
+    fn test_generate_subnets_invalid_new_prefix() {
+        let err = generate_subnets("10.0.0.0/24", 24, None, None).unwrap_err();
+        assert!(matches!(err, IpCalculatorError::InvalidPrefix(_)));
+    }
+
+    #[test]
+    fn test_get_subnet() {
+        assert!(get_subnet("10.0.0.0/24", 26, 2).is_ok());
+    }
+
+    #[test]
+    fn test_get_subnet_out_of_range() {
+        assert!(get_subnet("10.0.0.0/24", 26, 100).is_ok());
+    }
+
+    #[test]
+    fn test_find_ip_range_basic() {
+        let (start, end) = find_ip_range("192.168.1.0/24", 5, vec![]).unwrap();
+        assert_eq!(start, Ipv4Addr::new(192, 168, 1, 1));
+        assert_eq!(end, Ipv4Addr::new(192, 168, 1, 5));
+    }
+
+    #[test]
+    fn test_find_ip_range_with_exclusions() {
+        let exclusions = vec![
+            Ipv4Addr::new(192, 168, 1, 1),
+            Ipv4Addr::new(192, 168, 1, 2),
+        ];
+        let (start, end) = find_ip_range("192.168.1.0/24", 3, exclusions).unwrap();
+        assert_eq!(start, Ipv4Addr::new(192, 168, 1, 3));
+        assert_eq!(end, Ipv4Addr::new(192, 168, 1, 5));
+    }
+
+    #[test]
+    fn test_find_ip_range_too_large() {
+        let err = find_ip_range("10.0.0.0/30", 5, vec![]).unwrap_err();
+        assert!(matches!(err, IpCalculatorError::InvalidRange(_)));
+    }
+
+    #[test]
+    fn test_find_ip_range_zero_size() {
+        let err = find_ip_range("10.0.0.0/24", 0, vec![]).unwrap_err();
+        assert!(matches!(err, IpCalculatorError::InvalidRange(_)));
+    }
+
+    #[test]
+    fn test_command_help_find_by_name() {
+        let help = CommandHelp::find_by_name_or_alias("subnets").unwrap();
+        assert_eq!(help.name, "subnets");
+    }
+
+    #[test]
+    fn test_command_help_find_by_alias() {
+        let help = CommandHelp::find_by_name_or_alias("-s").unwrap();
+        assert_eq!(help.name, "subnets");
+    }
+
+    #[test]
+    fn test_command_help_find_unknown() {
+        assert!(CommandHelp::find_by_name_or_alias("nonexistent").is_none());
+    }
+
+    #[test]
+    fn test_execute_command_display() {
+        let cmd = Command::Display { cidr: "10.0.0.0/24".to_string() };
+        assert!(execute_command(cmd).is_ok());
+    }
+
+    #[test]
+    fn test_execute_command_check_ip_valid() {
+        let cmd = Command::CheckIP { ip: "192.168.1.1".to_string() };
+        assert!(execute_command(cmd).is_ok());
+    }
+
+    #[test]
+    fn test_execute_command_check_ip_invalid() {
+        let cmd = Command::CheckIP { ip: "bad".to_string() };
+        assert!(execute_command(cmd).is_err());
+    }
+
+    #[test]
+    fn test_execute_command_check_mask() {
+        let cmd = Command::CheckMask { mask: "24".to_string() };
+        assert!(execute_command(cmd).is_ok());
+
+        let cmd = Command::CheckMask { mask: "33".to_string() };
+        assert!(execute_command(cmd).is_err());
+    }
+
+    #[test]
+    fn test_execute_command_same_subnet() {
+        let cmd = Command::SameSubnet {
+            ip1: Ipv4Addr::new(10, 0, 0, 1),
+            ip2: Ipv4Addr::new(10, 0, 0, 2),
+            mask1: Ipv4Addr::new(255, 255, 255, 0),
+            mask2: None,
+        };
+        assert!(execute_command(cmd).is_ok());
+    }
+
+    #[test]
+    fn test_execute_command_get_subnet() {
+        let cmd = Command::GetSubnet {
+            cidr: "10.0.0.0/24".to_string(),
+            prefix: 26,
+            index: 1,
+        };
+        assert!(execute_command(cmd).is_ok());
+    }
+
+    #[test]
+    fn test_execute_command_find_range() {
+        let cmd = Command::FindRange {
+            cidr: "10.0.0.0/24".to_string(),
+            range_size: 5,
+            exclusions: vec![],
+        };
+        assert!(execute_command(cmd).is_ok());
     }
 }

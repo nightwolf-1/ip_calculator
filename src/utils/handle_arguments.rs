@@ -1,5 +1,5 @@
 use crate::libs::calc_ip::{
-    execute_command, is_cidr_or_mask, mask_to_cidr, parse_mask_or_cidr, Command, MaskOrCidr,IpCalculatorError,CommandHelp
+    execute_command, is_cidr_or_mask, mask_to_cidr, parse_mask_or_cidr, InputType, Command, IpCalculatorError, CommandHelp
 };
 use std::net::Ipv4Addr;
 use std::str::FromStr;
@@ -44,31 +44,49 @@ pub fn handle_arguments(args: Vec<String>) -> Result<String, IpCalculatorError> 
 
             let mut filter = None;
             let mut page = None;
+            let mut output_file = None;
             let mut i = 4;
             while i < args.len() {
-                match args[i].as_str() {
-                    "-f" => {
-                        if i + 1 < args.len() {
-                            filter = Some(args[i + 1].parse::<usize>().map_err(|_|
-                                IpCalculatorError::ArgumentsError("Invalid filter value".to_string())
-                            )?);
-                            i += 2;
-                        } else {
+                let arg = args[i].as_str();
+                if arg.starts_with("-f") {
+                    let val = if arg == "-f" {
+                        i += 1;
+                        if i >= args.len() {
                             return Err(IpCalculatorError::ArgumentsError("Missing value for -f option".to_string()));
                         }
-                    },
-                    "-p" => {
-                        if i + 1 < args.len() {
-                            page = Some(args[i + 1].parse::<usize>().map_err(|_|
-                                IpCalculatorError::ArgumentsError("Invalid page number".to_string())
-                            )?);
-                            i += 2;
-                        } else {
+                        args[i].as_str()
+                    } else {
+                        &arg[2..]
+                    };
+                    filter = Some(val.parse::<usize>().map_err(|_|
+                        IpCalculatorError::ArgumentsError("Invalid filter value".to_string())
+                    )?);
+                } else if arg.starts_with("-p") {
+                    let val = if arg == "-p" {
+                        i += 1;
+                        if i >= args.len() {
                             return Err(IpCalculatorError::ArgumentsError("Missing value for -p option".to_string()));
                         }
-                    },
-                    _ => i += 1,
+                        args[i].as_str()
+                    } else {
+                        &arg[2..]
+                    };
+                    let p = val.parse::<usize>().map_err(|_|
+                        IpCalculatorError::ArgumentsError("Invalid page number".to_string())
+                    )?;
+                    page = Some(p.saturating_sub(1));
+                } else if arg == "-o" || arg == "--output" {
+                    i += 1;
+                    if i >= args.len() {
+                        return Err(IpCalculatorError::ArgumentsError("Missing value for -o option".to_string()));
+                    }
+                    output_file = Some(args[i].clone());
+                } else if let Some(val) = arg.strip_prefix("-o") {
+                    output_file = Some(val.to_string());
+                } else if let Some(val) = arg.strip_prefix("--output=") {
+                    output_file = Some(val.to_string());
                 }
+                i += 1;
             }
 
             Command::Subnets {
@@ -76,6 +94,7 @@ pub fn handle_arguments(args: Vec<String>) -> Result<String, IpCalculatorError> 
                 prefix,
                 filter,
                 page,
+                output_file,
             }
         },
         "--get-subnet" => {
@@ -114,24 +133,9 @@ pub fn handle_arguments(args: Vec<String>) -> Result<String, IpCalculatorError> 
             let ip2 = Ipv4Addr::from_str(&args[3]).map_err(|_| 
                 IpCalculatorError::InvalidIP("Invalid IP address format for second IP".to_string())
             )?;
-            let mask1 = match parse_mask_or_cidr(&args[4], "mask")? {
-                MaskOrCidr::Mask(mask) => mask,
-                MaskOrCidr::Cidr(_) => {
-                    return Err(IpCalculatorError::MaskError(
-                        "Expected a mask, but a CIDR was provided for --same-subnet!".to_string()
-                    ));
-                }
-            };
-
+            let mask1 = parse_mask_or_cidr(&args[4], InputType::Mask)?.expect_mask();
             let mask2 = if args.len() == max_args {
-                match parse_mask_or_cidr(&args[5], "mask")? {
-                    MaskOrCidr::Mask(mask) => Some(mask),
-                    MaskOrCidr::Cidr(_) => {
-                        return Err(IpCalculatorError::MaskError(
-                            "Expected a mask, but a CIDR was provided for second mask!".to_string()
-                        ));
-                    }
-                }
+                Some(parse_mask_or_cidr(&args[5], InputType::Mask)?.expect_mask())
             } else {
                 None
             };
@@ -165,12 +169,11 @@ pub fn handle_arguments(args: Vec<String>) -> Result<String, IpCalculatorError> 
                 ));
             }
 
+            let calculate_subnet = crate::libs::calc_ip::calculate_subnet;
             let (cidr, range_size, exclusions) = if args[2].contains('/') {
-                if parse_mask_or_cidr(&args[2], "cidr").is_err() {
-                    return Err(IpCalculatorError::InvalidCIDR(
-                        format!("Invalid CIDR format for {}", args[2])
-                    ));
-                }
+                calculate_subnet(&args[2]).map_err(|_| IpCalculatorError::InvalidCIDR(
+                    format!("Invalid CIDR format for {}", args[2])
+                ))?;
 
                 let range_size = args[3].parse::<usize>().map_err(|_| 
                     IpCalculatorError::InvalidRange("Invalid number of hosts specified!".to_string())
@@ -189,14 +192,8 @@ pub fn handle_arguments(args: Vec<String>) -> Result<String, IpCalculatorError> 
                     ));
                 }
 
-                let cidr = match parse_mask_or_cidr(&args[3], "cidr")? {
-                    MaskOrCidr::Cidr(prefix) => format!("{}/{}", args[2], prefix),
-                    MaskOrCidr::Mask(_) => {
-                        return Err(IpCalculatorError::InvalidCIDR(
-                            "Expected CIDR, but got a mask!".to_string()
-                        ));
-                    }
-                };
+                let prefix = parse_mask_or_cidr(&args[3], InputType::Cidr)?.expect_cidr();
+                let cidr = format!("{}/{}", args[2], prefix);
 
                 let range_size = args[4].parse::<usize>().map_err(|_| 
                     IpCalculatorError::InvalidRange("Invalid number of hosts specified!".to_string())
@@ -224,19 +221,14 @@ pub fn handle_arguments(args: Vec<String>) -> Result<String, IpCalculatorError> 
             } else {
                 if args.len() == 3 {
                     let cidr = match is_cidr_or_mask(&args[2])? {
-                        "Mask" => {
+                        InputType::Mask => {
                             let mask = Ipv4Addr::from_str(&args[2]).map_err(|_| 
                                 IpCalculatorError::InvalidMask("Invalid mask format!".to_string())
                             )?;
                             let cidr_prefix = mask_to_cidr(mask)?;
                             format!("{}/{}", args[1], cidr_prefix)
                         }
-                        "CIDR" => format!("{}/{}", args[1], args[2]),
-                        _ => {
-                            return Err(IpCalculatorError::ConversionError(
-                                "Invalid mask or CIDR format!".to_string()
-                            ));
-                        }
+                        InputType::Cidr => format!("{}/{}", args[1], args[2]),
                     };
                     Command::Display { cidr }
                 } else {
